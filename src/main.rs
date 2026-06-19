@@ -1,3 +1,3 @@
 fn main() {
-    println!("Atlas Queue Phase 1: core in-memory queue");
+    println!("Atlas Queue Phase 1: core task engine");
 }

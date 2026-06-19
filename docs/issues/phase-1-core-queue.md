@@ -1,13 +1,15 @@
-# Phase 1: Core in-memory task queue
+# Phase 1: Core task engine
 
 ## Objective
 
-Build the first runnable Atlas Queue milestone: a single-process in-memory task queue.
+Build the first runnable Atlas Queue milestone: a single-process in-memory task
+engine.
 
 ## Scope
 
-- Define core task domain types.
-- Add push, pop, complete, get, and list behavior.
+- Define core typestate task domain types.
+- Add submit, next pending, complete, fail, requeue, get, and handler registry
+  behavior.
 - Keep the implementation synchronous and dependency-light.
 - Add focused Rust unit tests.
 - Update project docs for Phase 1.
@@ -16,8 +18,9 @@ Build the first runnable Atlas Queue milestone: a single-process in-memory task 
 
 - `cargo test` passes.
 - Queue pops tasks in FIFO order.
-- Tasks can be completed by ID.
-- Missing task completion returns a clear error.
+- Running tasks can be completed, failed, or requeued by consuming
+  `Task<Running>`.
+- Missing task lookup returns a clear error.
 - The code is organized so future API and worker phases can reuse the core queue logic.
 
 ## Out of Scope

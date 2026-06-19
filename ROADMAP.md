@@ -20,9 +20,10 @@ Status: Complete
 
 Deliverables:
 
-- Task domain model
-- In-memory FIFO queue
-- Push, pop, complete, get, and list operations
+- Typestate task domain model
+- In-memory FIFO engine
+- Submit, next pending, complete, fail, and requeue operations
+- Dyn-compatible handler registry
 - Unit tests
 
 ## Phase 2: REST API

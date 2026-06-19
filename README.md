@@ -7,12 +7,13 @@ worker, scheduling, persistence, and distributed systems fundamentals in Rust.
 
 ## Current Phase
 
-Phase 1: Core Queue
+Phase 1: Core Task Engine
 
-- Create tasks.
-- Push tasks into an in-memory FIFO queue.
-- Pop pending tasks for processing.
-- Mark tasks as completed.
+- Submit typed tasks with JSON payloads.
+- Track task lifecycle through typestate: pending, running, completed, failed.
+- Pull pending tasks in FIFO order for a worker.
+- Complete, fail, or requeue running tasks by consuming `Task<Running>`.
+- Register task handlers by task-type name.
 
 ## Run
 
