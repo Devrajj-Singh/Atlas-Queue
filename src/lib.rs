@@ -6,3 +6,4 @@
 //! dyn-compatible `ErasedHandler` trait objects.
 
 pub mod engine;
+pub mod pool;
