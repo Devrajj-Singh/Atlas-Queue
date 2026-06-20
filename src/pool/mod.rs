@@ -1,7 +1,7 @@
 //! Concurrent worker pool for Atlas Queue.
 //!
-//! A single dispatcher task owns `Engine` exclusively and is the only task that
-//! calls its methods. Workers communicate with the dispatcher over bounded
+//! A single dispatcher task drives `Engine` calls in this phase, while the
+//! engine itself is backed by shareable Postgres state. Workers communicate with the dispatcher over bounded
 //! channels: work channels provide backpressure, and result channels hand the
 //! owned `Task<Running>` back so completion and failure preserve Phase 1's
 //! typestate proof. Handler panics are isolated per task execution, so the
@@ -59,7 +59,7 @@ pub struct WorkerPoolConfig {
 pub struct WorkerPool {
     shutdown_tx: watch::Sender<bool>,
     handle: DispatcherHandle,
-    dispatcher: JoinHandle<Engine>,
+    dispatcher: JoinHandle<()>,
     workers: HashMap<WorkerId, JoinHandle<()>>,
 }
 
@@ -104,18 +104,15 @@ impl WorkerPool {
         self.handle.clone()
     }
 
-    pub async fn shutdown(self) -> Engine {
+    pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        let engine = self
-            .dispatcher
+        self.dispatcher
             .await
             .expect("dispatcher task should not panic");
 
         for (_worker_id, worker) in self.workers {
             worker.await.expect("worker task should not panic");
         }
-
-        engine
     }
 }
 
@@ -125,6 +122,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::{Value, json};
+    use sqlx::PgPool;
     use tokio::time::{Duration, sleep, timeout};
 
     use super::*;
@@ -188,8 +186,12 @@ mod tests {
         .expect("expected worker pool to process tasks before timeout");
     }
 
-    #[tokio::test]
-    async fn happy_path_under_concurrency_completes_all_tasks() {
+    fn engine(pool: PgPool) -> Engine {
+        Engine::new(pool, Duration::from_secs(30))
+    }
+
+    #[sqlx::test]
+    async fn happy_path_under_concurrency_completes_all_tasks(pool: PgPool) {
         let completed = Arc::new(AtomicUsize::new(0));
         let mut registry = HandlerRegistry::new();
         registry.register(
@@ -198,13 +200,17 @@ mod tests {
                 completed: Arc::clone(&completed),
             },
         );
-        let mut engine = Engine::new();
-        let ids = (0..6)
-            .map(|index| engine.submit("echo", json!({ "index": index })))
-            .collect::<Vec<_>>();
+        let engine = engine(pool);
+        let ids = futures::future::join_all(
+            (0..6).map(|index| engine.submit("echo", json!({ "index": index }))),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("submits should succeed");
 
         let pool = WorkerPool::spawn(
-            engine,
+            engine.clone(),
             registry,
             WorkerPoolConfig {
                 worker_count: 2,
@@ -214,18 +220,19 @@ mod tests {
         );
 
         wait_for_count(&completed, ids.len()).await;
-        let engine = pool.shutdown().await;
+        pool.shutdown().await;
 
         for id in ids {
-            let AnyTask::Completed(task) = engine.get(id).expect("task should be stored") else {
+            let AnyTask::Completed(task) = engine.get(id).await.expect("task should be stored")
+            else {
                 panic!("task should be completed");
             };
             assert_eq!(task.payload, task.state.output.0);
         }
     }
 
-    #[tokio::test]
-    async fn panic_isolation_fails_one_task_and_worker_continues() {
+    #[sqlx::test]
+    async fn panic_isolation_fails_one_task_and_worker_continues(pool: PgPool) {
         let completed = Arc::new(AtomicUsize::new(0));
         let mut registry = HandlerRegistry::new();
         registry.register(
@@ -234,12 +241,18 @@ mod tests {
                 completed: Arc::clone(&completed),
             },
         );
-        let mut engine = Engine::new();
-        let panic_id = engine.submit("maybe-panic", json!({ "panic": true }));
-        let normal_id = engine.submit("maybe-panic", json!({ "panic": false }));
+        let engine = engine(pool);
+        let panic_id = engine
+            .submit("maybe-panic", json!({ "panic": true }))
+            .await
+            .expect("submit should succeed");
+        let normal_id = engine
+            .submit("maybe-panic", json!({ "panic": false }))
+            .await
+            .expect("submit should succeed");
 
         let pool = WorkerPool::spawn(
-            engine,
+            engine.clone(),
             registry,
             WorkerPoolConfig {
                 worker_count: 1,
@@ -250,9 +263,12 @@ mod tests {
 
         wait_for_count(&completed, 1).await;
         sleep(Duration::from_millis(50)).await;
-        let engine = pool.shutdown().await;
+        pool.shutdown().await;
 
-        let AnyTask::Failed(task) = engine.get(panic_id).expect("panic task should be stored")
+        let AnyTask::Failed(task) = engine
+            .get(panic_id)
+            .await
+            .expect("panic task should be stored")
         else {
             panic!("panic task should fail");
         };
@@ -260,19 +276,25 @@ mod tests {
             matches!(&task.state.error, HandlerError::Permanent(message) if message.contains("panicked"))
         );
         assert!(matches!(
-            engine.get(normal_id).expect("normal task should be stored"),
+            engine
+                .get(normal_id)
+                .await
+                .expect("normal task should be stored"),
             AnyTask::Completed(_)
         ));
     }
 
-    #[tokio::test]
-    async fn missing_handler_marks_task_failed() {
+    #[sqlx::test]
+    async fn missing_handler_marks_task_failed(pool: PgPool) {
         let registry = HandlerRegistry::new();
-        let mut engine = Engine::new();
-        let id = engine.submit("missing", json!({}));
+        let engine = engine(pool);
+        let id = engine
+            .submit("missing", json!({}))
+            .await
+            .expect("submit should succeed");
 
         let pool = WorkerPool::spawn(
-            engine,
+            engine.clone(),
             registry,
             WorkerPoolConfig {
                 worker_count: 1,
@@ -282,9 +304,9 @@ mod tests {
         );
 
         sleep(Duration::from_millis(50)).await;
-        let engine = pool.shutdown().await;
+        pool.shutdown().await;
 
-        let AnyTask::Failed(task) = engine.get(id).expect("task should be stored") else {
+        let AnyTask::Failed(task) = engine.get(id).await.expect("task should be stored") else {
             panic!("missing handler task should fail");
         };
         assert!(
@@ -292,8 +314,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn backpressure_with_small_capacity_still_drains() {
+    #[sqlx::test]
+    async fn backpressure_with_small_capacity_still_drains(pool: PgPool) {
         let completed = Arc::new(AtomicUsize::new(0));
         let mut registry = HandlerRegistry::new();
         registry.register(
@@ -302,13 +324,17 @@ mod tests {
                 completed: Arc::clone(&completed),
             },
         );
-        let mut engine = Engine::new();
-        let ids = (0..8)
-            .map(|index| engine.submit("echo", json!({ "index": index })))
-            .collect::<Vec<_>>();
+        let engine = engine(pool);
+        let ids = futures::future::join_all(
+            (0..8).map(|index| engine.submit("echo", json!({ "index": index }))),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("submits should succeed");
 
         let pool = WorkerPool::spawn(
-            engine,
+            engine.clone(),
             registry,
             WorkerPoolConfig {
                 worker_count: 2,
@@ -318,18 +344,18 @@ mod tests {
         );
 
         wait_for_count(&completed, ids.len()).await;
-        let engine = pool.shutdown().await;
+        pool.shutdown().await;
 
         for id in ids {
             assert!(matches!(
-                engine.get(id).expect("task should be stored"),
+                engine.get(id).await.expect("task should be stored"),
                 AnyTask::Completed(_)
             ));
         }
     }
 
-    #[tokio::test]
-    async fn dispatcher_drains_results_while_waiting_for_backpressured_worker() {
+    #[sqlx::test]
+    async fn dispatcher_drains_results_while_waiting_for_backpressured_worker(pool: PgPool) {
         timeout(Duration::from_secs(2), async {
             let completed = Arc::new(AtomicUsize::new(0));
             let mut registry = HandlerRegistry::new();
@@ -339,13 +365,17 @@ mod tests {
                     completed: Arc::clone(&completed),
                 },
             );
-            let mut engine = Engine::new();
-            let ids = (0..5)
-                .map(|index| engine.submit("slow-echo", json!({ "index": index })))
-                .collect::<Vec<_>>();
+            let engine = engine(pool);
+            let ids = futures::future::join_all(
+                (0..5).map(|index| engine.submit("slow-echo", json!({ "index": index }))),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("submits should succeed");
 
             let pool = WorkerPool::spawn(
-                engine,
+                engine.clone(),
                 registry,
                 WorkerPoolConfig {
                     worker_count: 1,
@@ -355,11 +385,11 @@ mod tests {
             );
 
             wait_for_count(&completed, ids.len()).await;
-            let engine = pool.shutdown().await;
+            pool.shutdown().await;
 
             for id in ids {
                 assert!(matches!(
-                    engine.get(id).expect("task should be stored"),
+                    engine.get(id).await.expect("task should be stored"),
                     AnyTask::Completed(_)
                 ));
             }
@@ -368,10 +398,10 @@ mod tests {
         .expect("worker pool deadlocked while dispatcher was waiting on a full work channel");
     }
 
-    #[tokio::test]
-    async fn graceful_shutdown_with_no_pending_work_returns_promptly() {
+    #[sqlx::test]
+    async fn graceful_shutdown_with_no_pending_work_returns_promptly(pool: PgPool) {
         let pool = WorkerPool::spawn(
-            Engine::new(),
+            engine(pool),
             HandlerRegistry::new(),
             WorkerPoolConfig {
                 worker_count: 2,

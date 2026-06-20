@@ -23,6 +23,22 @@ jobs:
   build-and-test:
     name: Build, Test, Lint
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas
+          POSTGRES_DB: atlas_queue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://atlas:atlas@localhost:5432/atlas_queue
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,6 +58,12 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets --verbose
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --locked --no-default-features --features postgres
+
+      - name: Run migrations
+        run: sqlx migrate run
 
       - name: Run tests
         run: cargo test --all-targets --verbose
