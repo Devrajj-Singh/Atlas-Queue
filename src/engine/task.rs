@@ -1,16 +1,23 @@
 use std::fmt;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::engine::handler::{HandlerError, TaskOutput};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct TaskId(Uuid);
 
 impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub fn from_uuid(id: Uuid) -> Self {
+        Self(id)
     }
 }
 
@@ -26,7 +33,16 @@ impl fmt::Display for TaskId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+impl FromStr for TaskId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct WorkerId(Uuid);
 
 impl WorkerId {
