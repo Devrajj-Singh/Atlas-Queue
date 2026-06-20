@@ -17,9 +17,11 @@ use crate::engine::core::Engine;
 use crate::engine::handler::{HandlerError, TaskOutput};
 use crate::engine::registry::HandlerRegistry;
 use crate::engine::task::{Running, Task, WorkerId};
+use crate::pool::control::{ControlRequest, DispatcherHandle};
 use crate::pool::dispatcher::Dispatcher;
 use crate::pool::worker::Worker;
 
+pub mod control;
 pub mod dispatcher;
 pub mod worker;
 
@@ -46,6 +48,7 @@ pub enum TaskResult {
 pub struct WorkerPoolConfig {
     pub worker_count: usize,
     pub channel_capacity: usize,
+    pub control_channel_capacity: usize,
 }
 
 /// Fixed-size worker pool.
@@ -55,6 +58,7 @@ pub struct WorkerPoolConfig {
 /// replacing the pool's bookkeeping model.
 pub struct WorkerPool {
     shutdown_tx: watch::Sender<bool>,
+    handle: DispatcherHandle,
     dispatcher: JoinHandle<Engine>,
     workers: HashMap<WorkerId, JoinHandle<()>>,
 }
@@ -67,6 +71,9 @@ impl WorkerPool {
         // maximum burst of simultaneous result sends the dispatcher must absorb.
         let result_capacity = config.worker_count.max(1);
         let (result_tx, result_rx) = mpsc::channel::<TaskResult>(result_capacity);
+        let control_capacity = config.control_channel_capacity.max(1);
+        let (control_tx, control_rx) = mpsc::channel::<ControlRequest>(control_capacity);
+        let handle = DispatcherHandle::new(control_tx);
 
         let mut work_txs = Vec::with_capacity(config.worker_count);
         let mut workers = HashMap::with_capacity(config.worker_count);
@@ -81,14 +88,20 @@ impl WorkerPool {
         }
         drop(result_tx);
 
-        let dispatcher = Dispatcher::new(engine, registry).run(work_txs, result_rx, shutdown_rx);
+        let dispatcher =
+            Dispatcher::new(engine, registry).run(work_txs, result_rx, control_rx, shutdown_rx);
         let dispatcher = tokio::spawn(dispatcher);
 
         Self {
             shutdown_tx,
+            handle,
             dispatcher,
             workers,
         }
+    }
+
+    pub fn handle(&self) -> DispatcherHandle {
+        self.handle.clone()
     }
 
     pub async fn shutdown(self) -> Engine {
@@ -196,6 +209,7 @@ mod tests {
             WorkerPoolConfig {
                 worker_count: 2,
                 channel_capacity: 2,
+                control_channel_capacity: 8,
             },
         );
 
@@ -230,6 +244,7 @@ mod tests {
             WorkerPoolConfig {
                 worker_count: 1,
                 channel_capacity: 1,
+                control_channel_capacity: 8,
             },
         );
 
@@ -262,6 +277,7 @@ mod tests {
             WorkerPoolConfig {
                 worker_count: 1,
                 channel_capacity: 1,
+                control_channel_capacity: 8,
             },
         );
 
@@ -297,6 +313,7 @@ mod tests {
             WorkerPoolConfig {
                 worker_count: 2,
                 channel_capacity: 1,
+                control_channel_capacity: 8,
             },
         );
 
@@ -333,6 +350,7 @@ mod tests {
                 WorkerPoolConfig {
                     worker_count: 1,
                     channel_capacity: 1,
+                    control_channel_capacity: 8,
                 },
             );
 
@@ -358,6 +376,7 @@ mod tests {
             WorkerPoolConfig {
                 worker_count: 2,
                 channel_capacity: 1,
+                control_channel_capacity: 8,
             },
         );
 

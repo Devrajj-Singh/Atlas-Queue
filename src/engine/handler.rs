@@ -1,4 +1,5 @@
 use serde::de::DeserializeOwned;
+use serde::{Serialize, Serializer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
@@ -12,7 +13,48 @@ pub enum HandlerError {
     Permanent(String),
 }
 
-#[derive(Debug)]
+impl Clone for HandlerError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::InvalidPayload(message) => Self::InvalidPayload(message.clone()),
+            Self::ExecutionFailed(error) => {
+                Self::ExecutionFailed(anyhow::anyhow!(error.to_string()))
+            }
+            Self::Transient(message) => Self::Transient(message.clone()),
+            Self::Permanent(message) => Self::Permanent(message.clone()),
+        }
+    }
+}
+
+impl Serialize for HandlerError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct ErrorBody<'a> {
+            kind: &'a str,
+            message: String,
+            retryable: bool,
+        }
+
+        let (kind, retryable) = match self {
+            Self::InvalidPayload(_) => ("invalid_payload", false),
+            Self::ExecutionFailed(_) => ("execution_failed", false),
+            Self::Transient(_) => ("transient", true),
+            Self::Permanent(_) => ("permanent", false),
+        };
+
+        ErrorBody {
+            kind,
+            message: self.to_string(),
+            retryable,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskOutput(pub serde_json::Value);
 
 /// Type-safe handler API for implementors.

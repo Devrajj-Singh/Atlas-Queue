@@ -5,5 +5,6 @@
 //! type-safe payloads through `TaskHandler`, while the registry stores
 //! dyn-compatible `ErasedHandler` trait objects.
 
+pub mod api;
 pub mod engine;
 pub mod pool;

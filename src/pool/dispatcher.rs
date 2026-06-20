@@ -7,8 +7,11 @@ use crate::engine::core::Engine;
 use crate::engine::handler::HandlerError;
 use crate::engine::registry::HandlerRegistry;
 use crate::engine::task::WorkerId;
+use crate::pool::control::ControlRequest;
 use crate::pool::{TaskResult, WorkItem};
 
+/// Owns `Engine`, dispatches work to workers, applies worker results, and
+/// serves submit/status control requests from external callers.
 pub struct Dispatcher {
     engine: Engine,
     registry: Arc<HandlerRegistry>,
@@ -35,6 +38,7 @@ impl Dispatcher {
         mut self,
         work_txs: Vec<mpsc::Sender<WorkItem>>,
         mut result_rx: mpsc::Receiver<TaskResult>,
+        mut control_rx: mpsc::Receiver<ControlRequest>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Engine {
         let mut pending_work = None;
@@ -56,7 +60,7 @@ impl Dispatcher {
             }
 
             if work_txs.is_empty() {
-                self.wait_for_work_or_shutdown(&mut shutdown, &mut result_rx)
+                self.wait_for_work_or_shutdown(&mut shutdown, &mut result_rx, &mut control_rx)
                     .await;
                 continue;
             }
@@ -75,8 +79,12 @@ impl Dispatcher {
                         pending_work = Some((worker_index, task_id, item));
                     }
                     None => {
-                        self.wait_for_work_or_shutdown(&mut shutdown, &mut result_rx)
-                            .await;
+                        self.wait_for_work_or_shutdown(
+                            &mut shutdown,
+                            &mut result_rx,
+                            &mut control_rx,
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -86,7 +94,17 @@ impl Dispatcher {
                 continue;
             };
 
+            // Keep control requests ahead of work reservation when both are
+            // ready so HTTP submissions/status checks stay responsive even
+            // while a previously selected task is waiting for worker capacity.
             let permit = tokio::select! {
+                biased;
+                request = control_rx.recv() => {
+                    if let Some(request) = request {
+                        self.handle_control(request);
+                    }
+                    None
+                }
                 permit = work_txs[worker_index].reserve() => Some(permit),
                 result = result_rx.recv(), if self.in_flight > 0 => {
                     if let Some(result) = result {
@@ -117,6 +135,23 @@ impl Dispatcher {
         }
     }
 
+    fn handle_control(&mut self, request: ControlRequest) {
+        match request {
+            ControlRequest::Submit {
+                task_type,
+                payload,
+                respond_to,
+            } => {
+                let id = self.engine.submit(task_type, payload);
+                let _ = respond_to.send(id);
+            }
+            ControlRequest::GetStatus { id, respond_to } => {
+                let status = self.engine.get(id).map(Into::into);
+                let _ = respond_to.send(status);
+            }
+        }
+    }
+
     fn apply_result(&mut self, result: TaskResult) {
         self.in_flight = self.in_flight.saturating_sub(1);
 
@@ -134,8 +169,14 @@ impl Dispatcher {
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
         result_rx: &mut mpsc::Receiver<TaskResult>,
+        control_rx: &mut mpsc::Receiver<ControlRequest>,
     ) {
         tokio::select! {
+            request = control_rx.recv() => {
+                if let Some(request) = request {
+                    self.handle_control(request);
+                }
+            }
             result = result_rx.recv(), if self.in_flight > 0 => {
                 if let Some(result) = result {
                     self.apply_result(result);
