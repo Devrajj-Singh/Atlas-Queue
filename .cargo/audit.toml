@@ -1,0 +1,10 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa crate, "Marvin Attack" timing side-channel):
+# transitive dependency pulled in via sqlx, not used directly by Atlas Queue.
+# No fixed upgrade is currently available upstream (confirmed via `cargo
+# audit` output as of this commit). Not reachable through Atlas Queue's
+# actual usage, which only exercises sqlx's Postgres feature with standard
+# username/password authentication, not RSA key exchange. Revisit this
+# suppression if sqlx ships a patched version, or if this dependency
+# becomes reachable through code we actually execute.
+ignore = ["RUSTSEC-2023-0071"]

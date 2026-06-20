@@ -7,13 +7,13 @@ use crate::engine::core::Engine;
 use crate::engine::handler::HandlerError;
 use crate::engine::registry::HandlerRegistry;
 use crate::engine::task::WorkerId;
-use crate::pool::control::ControlRequest;
+use crate::pool::control::{ControlRequest, TaskSnapshot};
 use crate::pool::{TaskResult, WorkItem};
 
-/// Owns `Engine`, dispatches work to workers, applies worker results, and
+/// Dispatches work to workers, applies worker results, and
 /// serves submit/status control requests from external callers.
 pub struct Dispatcher {
-    engine: Engine,
+    engine: Arc<Engine>,
     registry: Arc<HandlerRegistry>,
     next_worker_index: usize,
     in_flight: usize,
@@ -22,41 +22,36 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub fn new(engine: Engine, registry: Arc<HandlerRegistry>) -> Self {
         Self {
-            engine,
+            engine: Arc::new(engine),
             registry,
             next_worker_index: 0,
             in_flight: 0,
         }
     }
 
-    /// Runs the dispatcher and returns the engine instead of dropping it.
-    ///
-    /// Future phases, especially persistence, will need to inspect or flush
-    /// final task state after shutdown. Result handling stays in this loop so
-    /// `Engine` is only ever touched by the dispatcher task.
     pub async fn run(
         mut self,
         work_txs: Vec<mpsc::Sender<WorkItem>>,
         mut result_rx: mpsc::Receiver<TaskResult>,
         mut control_rx: mpsc::Receiver<ControlRequest>,
         mut shutdown: watch::Receiver<bool>,
-    ) -> Engine {
+    ) {
         let mut pending_work = None;
 
         loop {
             while let Ok(result) = result_rx.try_recv() {
-                self.apply_result(result);
+                self.apply_result(result).await;
             }
 
             if *shutdown.borrow() && pending_work.is_none() {
                 while self.in_flight > 0 {
                     match result_rx.recv().await {
-                        Some(result) => self.apply_result(result),
+                        Some(result) => self.apply_result(result).await,
                         None => break,
                     }
                 }
 
-                return self.engine;
+                return;
             }
 
             if work_txs.is_empty() {
@@ -66,8 +61,8 @@ impl Dispatcher {
             }
 
             if pending_work.is_none() {
-                match self.engine.next_pending(WorkerId::new()) {
-                    Some(task) => {
+                match self.engine.next_pending(WorkerId::new()).await {
+                    Ok(Some(task)) => {
                         let task_id = task.id;
                         let item = WorkItem {
                             task,
@@ -78,7 +73,17 @@ impl Dispatcher {
 
                         pending_work = Some((worker_index, task_id, item));
                     }
-                    None => {
+                    Ok(None) => {
+                        self.wait_for_work_or_shutdown(
+                            &mut shutdown,
+                            &mut result_rx,
+                            &mut control_rx,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to dequeue pending task");
                         self.wait_for_work_or_shutdown(
                             &mut shutdown,
                             &mut result_rx,
@@ -101,14 +106,14 @@ impl Dispatcher {
                 biased;
                 request = control_rx.recv() => {
                     if let Some(request) = request {
-                        self.handle_control(request);
+                        self.handle_control(request).await;
                     }
                     None
                 }
                 permit = work_txs[worker_index].reserve() => Some(permit),
                 result = result_rx.recv(), if self.in_flight > 0 => {
                     if let Some(result) = result {
-                        self.apply_result(result);
+                        self.apply_result(result).await;
                     }
                     None
                 }
@@ -126,7 +131,9 @@ impl Dispatcher {
                     let error = HandlerError::Permanent(format!(
                         "worker channel closed before task {task_id} could be dispatched",
                     ));
-                    self.engine.mark_failed(item.task, error);
+                    if let Err(error) = self.engine.mark_failed(item.task, error).await {
+                        tracing::error!(%error, %task_id, "failed to mark undispatched task failed");
+                    }
                 }
                 None => {
                     pending_work = Some((worker_index, task_id, item));
@@ -135,32 +142,42 @@ impl Dispatcher {
         }
     }
 
-    fn handle_control(&mut self, request: ControlRequest) {
+    async fn handle_control(&mut self, request: ControlRequest) {
         match request {
             ControlRequest::Submit {
                 task_type,
                 payload,
                 respond_to,
             } => {
-                let id = self.engine.submit(task_type, payload);
-                let _ = respond_to.send(id);
+                let result = self.engine.submit(task_type, payload).await;
+                let _ = respond_to.send(result);
             }
             ControlRequest::GetStatus { id, respond_to } => {
-                let status = self.engine.get(id).map(Into::into);
+                let status = self
+                    .engine
+                    .get(id)
+                    .await
+                    .map(|task| TaskSnapshot::from(&task));
                 let _ = respond_to.send(status);
             }
         }
     }
 
-    fn apply_result(&mut self, result: TaskResult) {
+    async fn apply_result(&mut self, result: TaskResult) {
         self.in_flight = self.in_flight.saturating_sub(1);
 
         match result {
             TaskResult::Completed { task, output } => {
-                self.engine.mark_completed(task, output);
+                let task_id = task.id;
+                if let Err(error) = self.engine.mark_completed(task, output).await {
+                    tracing::error!(%error, %task_id, "failed to mark task completed");
+                }
             }
             TaskResult::Failed { task, error } => {
-                self.engine.mark_failed(task, error);
+                let task_id = task.id;
+                if let Err(error) = self.engine.mark_failed(task, error).await {
+                    tracing::error!(%error, %task_id, "failed to mark task failed");
+                }
             }
         }
     }
@@ -174,12 +191,12 @@ impl Dispatcher {
         tokio::select! {
             request = control_rx.recv() => {
                 if let Some(request) = request {
-                    self.handle_control(request);
+                    self.handle_control(request).await;
                 }
             }
             result = result_rx.recv(), if self.in_flight > 0 => {
                 if let Some(result) = result {
-                    self.apply_result(result);
+                    self.apply_result(result).await;
                 }
             }
             _ = shutdown.changed() => {}

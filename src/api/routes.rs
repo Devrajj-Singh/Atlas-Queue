@@ -21,6 +21,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
+    use sqlx::PgPool;
     use tokio::time::{Duration, sleep, timeout};
     use tower::ServiceExt;
 
@@ -41,11 +42,24 @@ mod tests {
         }
     }
 
-    fn spawn_test_app() -> (Router, WorkerPool) {
+    struct SlowHandler;
+
+    #[async_trait::async_trait]
+    impl TaskHandler for SlowHandler {
+        type Payload = Value;
+
+        async fn execute(&self, payload: Self::Payload) -> Result<TaskOutput, HandlerError> {
+            sleep(Duration::from_millis(250)).await;
+            Ok(TaskOutput(payload))
+        }
+    }
+
+    fn spawn_test_app(db: PgPool) -> (Router, WorkerPool) {
         let mut registry = HandlerRegistry::new();
         registry.register("echo", EchoHandler);
+        registry.register("slow", SlowHandler);
         let pool = WorkerPool::spawn(
-            Engine::new(),
+            Engine::new(db, Duration::from_secs(30)),
             registry,
             WorkerPoolConfig {
                 worker_count: 1,
@@ -120,9 +134,9 @@ mod tests {
         .expect("task should reach expected status")
     }
 
-    #[tokio::test]
-    async fn submit_then_get_status_full_http_round_trip() {
-        let (app, pool) = spawn_test_app();
+    #[sqlx::test]
+    async fn submit_then_get_status_full_http_round_trip(db: PgPool) {
+        let (app, pool) = spawn_test_app(db);
 
         let (status, body) = post_task(app.clone(), "echo").await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -131,24 +145,38 @@ mod tests {
 
         let (status, body) = get_task(app.clone(), id).await;
         assert!(
-            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+            status == StatusCode::OK,
             "status was {status}, body was {body}"
         );
-        if status == StatusCode::OK {
-            assert!(matches!(
-                body["status"].as_str(),
-                Some("pending" | "completed" | "failed")
-            ));
-        } else {
-            poll_task_status(app, id, "completed").await;
-        }
+        assert!(matches!(
+            body["status"].as_str(),
+            Some("pending" | "running" | "completed" | "failed")
+        ));
 
         pool.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn unknown_task_returns_404() {
-        let (app, pool) = spawn_test_app();
+    #[sqlx::test]
+    async fn running_task_returns_200_with_lease_fields(db: PgPool) {
+        let (app, pool) = spawn_test_app(db);
+
+        let (status, body) = post_task(app.clone(), "slow").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["id"].as_str().expect("id should be a string");
+
+        let body = poll_task_status(app, id, "running").await;
+        assert_eq!(body["worker_id"].as_str().map(str::is_empty), Some(false));
+        assert_eq!(
+            body["locked_until"].as_str().map(str::is_empty),
+            Some(false)
+        );
+
+        pool.shutdown().await;
+    }
+
+    #[sqlx::test]
+    async fn unknown_task_returns_404(db: PgPool) {
+        let (app, pool) = spawn_test_app(db);
 
         let (status, body) = get_task(app, &uuid::Uuid::new_v4().to_string()).await;
 
@@ -157,9 +185,9 @@ mod tests {
         pool.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn malformed_task_id_returns_400() {
-        let (app, pool) = spawn_test_app();
+    #[sqlx::test]
+    async fn malformed_task_id_returns_400(db: PgPool) {
+        let (app, pool) = spawn_test_app(db);
 
         let (status, body) = get_task(app, "not-a-uuid").await;
 
@@ -168,9 +196,9 @@ mod tests {
         pool.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn unregistered_task_type_submits_then_eventually_fails() {
-        let (app, pool) = spawn_test_app();
+    #[sqlx::test]
+    async fn unregistered_task_type_submits_then_eventually_fails(db: PgPool) {
+        let (app, pool) = spawn_test_app(db);
 
         let (status, body) = post_task(app.clone(), "missing").await;
         assert_eq!(status, StatusCode::ACCEPTED);

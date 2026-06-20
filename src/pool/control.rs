@@ -10,7 +10,7 @@ pub enum ControlRequest {
     Submit {
         task_type: String,
         payload: serde_json::Value,
-        respond_to: oneshot::Sender<TaskId>,
+        respond_to: oneshot::Sender<Result<TaskId, EngineError>>,
     },
     GetStatus {
         id: TaskId,
@@ -41,6 +41,7 @@ pub enum TaskSnapshot {
         id: TaskId,
         worker_id: WorkerId,
         started_at: DateTime<Utc>,
+        locked_until: DateTime<Utc>,
     },
     Completed {
         id: TaskId,
@@ -65,6 +66,7 @@ impl From<&AnyTask> for TaskSnapshot {
                 id: task.id,
                 worker_id: task.state.worker_id,
                 started_at: task.state.started_at,
+                locked_until: task.state.locked_until,
             },
             AnyTask::Completed(task) => Self::Completed {
                 id: task.id,
@@ -94,7 +96,7 @@ impl DispatcherHandle {
         &self,
         task_type: String,
         payload: serde_json::Value,
-    ) -> Result<TaskId, DispatcherUnavailable> {
+    ) -> Result<TaskId, GetStatusError> {
         let (respond_to, response_rx) = oneshot::channel();
         self.control_tx
             .send(ControlRequest::Submit {
@@ -105,7 +107,7 @@ impl DispatcherHandle {
             .await
             .map_err(|_| DispatcherUnavailable)?;
 
-        response_rx.await.map_err(|_| DispatcherUnavailable)
+        Ok(response_rx.await.map_err(|_| DispatcherUnavailable)??)
     }
 
     pub async fn get_status(&self, id: TaskId) -> Result<TaskSnapshot, GetStatusError> {

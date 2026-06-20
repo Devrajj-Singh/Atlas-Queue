@@ -17,6 +17,8 @@ pub enum ApiError {
     TaskNotFound,
     #[error("dispatcher is unavailable")]
     DispatcherUnavailable,
+    #[error("internal server error")]
+    InternalServerError,
 }
 
 impl From<DispatcherUnavailable> for ApiError {
@@ -28,9 +30,8 @@ impl From<DispatcherUnavailable> for ApiError {
 impl From<EngineError> for ApiError {
     fn from(error: EngineError) -> Self {
         match error {
-            // In Phase 3, `Engine` does not retain running tasks, so in-flight
-            // and genuinely unknown ids intentionally share the same 404.
             EngineError::NotFound(_) => Self::TaskNotFound,
+            EngineError::InvalidStatus(_) | EngineError::Database(_) => Self::InternalServerError,
         }
     }
 }
@@ -50,6 +51,7 @@ impl IntoResponse for ApiError {
             Self::BadTaskId => StatusCode::BAD_REQUEST,
             Self::TaskNotFound => StatusCode::NOT_FOUND,
             Self::DispatcherUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         let body = Json(ErrorResponse {
